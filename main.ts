@@ -82,7 +82,6 @@ function identLine(): string {
 // ---------------------------------------------------------------------------
 // Small utilities
 // ---------------------------------------------------------------------------
-const sha1 = (b: Buffer): string => crypto.createHash('sha1').update(b).digest('hex');
 const isOid = (s: string): boolean => /^[0-9a-f]{40}$/.test(s);
 const b64enc = (b: Buffer): string => b.toString('base64');
 const b64dec = (s: string): Buffer => Buffer.from(s.replace(/[\r\n\t ]+/g, ''), 'base64');
@@ -125,7 +124,19 @@ function parsePktLines(buf: Buffer): Pkt[] {
 // is unknown, so find it: a truncated prefix throws, a prefix at or past the
 // true end succeeds (trailing bytes are ignored), so the predicate is
 // monotone in the prefix length.
-function inflateAt(buf: Buffer, off: number): { data: Buffer; next: number } {
+//
+// Fast path (Node >= 22.15): a single `inflateSync` with `{ info: true }`
+// reports the consumed compressed length via `engine.bytesWritten`, so no
+// probing is needed. Support is feature-detected ONCE at startup; anything
+// unexpected falls back to the binary-search probe below, which works on
+// every Node.
+let INFLATE_INFO_OK = false;
+try {
+  const probe = zlib.deflateSync(Buffer.from('forge-probe'));
+  const r = zlib.inflateSync(probe, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+  INFLATE_INFO_OK = typeof r?.engine?.bytesWritten === 'number' && r.buffer.equals(Buffer.from('forge-probe'));
+} catch { INFLATE_INFO_OK = false; }
+function inflateAtLegacy(buf: Buffer, off: number): { data: Buffer; next: number } {
   const remaining = buf.length - off;
   if (remaining <= 0) throw new Error('inflate past end of pack');
   const ok = (len: number): Buffer | null => {
@@ -147,6 +158,15 @@ function inflateAt(buf: Buffer, off: number): { data: Buffer; next: number } {
     if (d !== null) { best = mid; bestData = d; r = mid - 1; } else l = mid + 1;
   }
   return { data: bestData, next: off + best };
+}
+function inflateAt(buf: Buffer, off: number): { data: Buffer; next: number } {
+  const remaining = buf.length - off;
+  if (remaining <= 0) throw new Error('inflate past end of pack');
+  if (INFLATE_INFO_OK) {
+    const r = zlib.inflateSync(buf.subarray(off), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    return { data: r.buffer, next: off + r.engine.bytesWritten };
+  }
+  return inflateAtLegacy(buf, off);
 }
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
   let p = 0;
@@ -188,7 +208,7 @@ interface GitObj { type: ObjType; data: Buffer }
 const TYPE_CODE: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const CODE_TYPE: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 function hashObject(type: ObjType, data: Buffer): string {
-  return sha1(Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'utf8'), data]));
+  return crypto.createHash('sha1').update(Buffer.from(`${type} ${data.length}\0`, 'utf8')).update(data).digest('hex');
 }
 interface TreeEntry { mode: string; name: string; oid: string }
 function parseTree(data: Buffer): TreeEntry[] {
@@ -288,6 +308,7 @@ function readPack(buf: Buffer, baseResolver?: (oid: string) => { type: ObjType; 
   if (version !== 2) throw new Error('bad pack version');
   const entries: PackEntry[] = [];
   const byOffset = new Map<number, PackEntry>();
+  const byOid = new Map<string, PackEntry>();
   let off = 12;
   for (let i = 0; i < count; i++) {
     const start = off;
@@ -316,7 +337,7 @@ function readPack(buf: Buffer, baseResolver?: (oid: string) => { type: ObjType; 
       // baseResolver when given.
       const base = typeCode === 6
         ? byOffset.get(baseOff as number)
-        : (entries.find((e) => e.oid === baseOid) ?? (baseResolver ? baseResolver(baseOid as string) : undefined));
+        : (byOid.get(baseOid as string) ?? (baseResolver ? baseResolver(baseOid as string) : undefined));
       if (!base) throw new Error('delta base missing');
       data = applyDelta(base.data, inf.data); type = base.type;
     } else {
@@ -325,7 +346,7 @@ function readPack(buf: Buffer, baseResolver?: (oid: string) => { type: ObjType; 
     }
     const oid = hashObject(type, data);
     const entry: PackEntry = { type, data, oid };
-    entries.push(entry); byOffset.set(start, entry);
+    entries.push(entry); byOffset.set(start, entry); byOid.set(oid, entry);
   }
   const trailer = buf.subarray(buf.length - 20);
   const expect = crypto.createHash('sha1').update(buf.subarray(0, buf.length - 20)).digest();
@@ -338,7 +359,7 @@ function readPack(buf: Buffer, baseResolver?: (oid: string) => { type: ObjType; 
 // ---------------------------------------------------------------------------
 interface IssueRec {
   number: number; title: string; body: string; state: 'open' | 'closed';
-  labels: string[]; seq: number; dbId: number; createdAt: string; updatedAt: string;
+  labels: string[]; seq: number; dbId: number; nodeId: string; createdAt: string; updatedAt: string;
   comments: { id: number; body: string; createdAt: string }[];
 }
 interface PullRec {
@@ -356,6 +377,8 @@ interface Repo {
   pulls: Map<number, PullRec>;
   nextNumber: number; // shared issue/PR numbering, GitHub-style
   nextCommentId: number;
+  version: number; // +1 on every objects/refs mutation; fetch cache key
+  fetchCache: Map<string, Buffer>; // bounded cache of fetch responses
 }
 const repos = new Map<string, Repo>();
 let nextRepoDbId = 1000;
@@ -373,13 +396,19 @@ function createRepo(name: string, isPrivate: boolean, description: string): Repo
     defaultBranch: 'main', createdSeq: tick,
     objects: new Map(), refs: new Map(), labels: new Map(),
     issues: new Map(), pulls: new Map(), nextNumber: 1, nextCommentId: 1,
+    version: 0, fetchCache: new Map(),
   };
   repos.set(repoKey(VIEWER.login, name), r);
   return r;
 }
+// Bump the repo version and drop cached fetch responses. Called on EVERY
+// mutation of objects/refs so the fetch cache (keyed by version) can never
+// serve a stale pack. Issue/PR/label changes do not affect fetch output,
+// so they do not bump.
+function bumpVersion(repo: Repo): void { repo.version++; repo.fetchCache.clear(); }
 function putObj(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) { repo.objects.set(oid, { type, data }); bumpVersion(repo); }
   return oid;
 }
 function globalId(kind: string, ...parts: (string | number)[]): string {
@@ -460,8 +489,8 @@ function isAncestor(repo: Repo, anc: string, tip: string): boolean {
 function mergeBase(repo: Repo, a: string, b: string): string | null {
   const ancA = new Set<string>(); const qa = [a];
   while (qa.length) { const c = qa.pop() as string; if (ancA.has(c)) continue; ancA.add(c); const o = repo.objects.get(c); if (o && o.type === 'commit') for (const p of parseCommit(o.data).parents) qa.push(p); }
-  const seen = new Set<string>(); const qb = [b];
-  while (qb.length) { const c = qb.shift() as string; if (ancA.has(c)) return c; if (seen.has(c)) continue; seen.add(c); const o = repo.objects.get(c); if (o && o.type === 'commit') for (const p of parseCommit(o.data).parents) qb.push(p); }
+  const seen = new Set<string>(); const qb = [b]; let qbi = 0;
+  while (qbi < qb.length) { const c = qb[qbi++] as string; if (ancA.has(c)) return c; if (seen.has(c)) continue; seen.add(c); const o = repo.objects.get(c); if (o && o.type === 'commit') for (const p of parseCommit(o.data).parents) qb.push(p); }
   return null;
 }
 // Reachable objects from tips. depth limits commit generations (1 = tips only).
@@ -471,6 +500,7 @@ function collectReachable(repo: Repo, tips: Iterable<string>, opts: { depth?: nu
   const shallow: string[] = [];
   const queue: { oid: string; dist: number }[] = [];
   for (const t of tips) queue.push({ oid: t, dist: 0 });
+  let qi = 0; // index pointer instead of shift(): queue only grows, O(1) per pop
   const seenCommit = new Set<string>();
   const addObj = (oid: string): GitObj | null => {
     const o = repo.objects.get(oid); if (!o) return null;
@@ -484,8 +514,8 @@ function collectReachable(repo: Repo, tips: Iterable<string>, opts: { depth?: nu
       else addObj(e.oid);
     }
   };
-  while (queue.length) {
-    const { oid, dist } = queue.shift() as { oid: string; dist: number };
+  while (qi < queue.length) {
+    const { oid, dist } = queue[qi++] as { oid: string; dist: number };
     if (seenCommit.has(oid)) continue;
     seenCommit.add(oid);
     const o = addObj(oid); if (!o) continue;
@@ -637,8 +667,9 @@ interface FetchArgs {
 function distanceToBoundary(repo: Repo, tip: string, boundary: Set<string>): number | null {
   const seen = new Set<string>();
   const queue: { oid: string; dist: number }[] = [{ oid: tip, dist: 0 }];
-  while (queue.length) {
-    const { oid, dist } = queue.shift() as { oid: string; dist: number };
+  let qi = 0;
+  while (qi < queue.length) {
+    const { oid, dist } = queue[qi++] as { oid: string; dist: number };
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (boundary.has(oid)) return dist;
@@ -685,7 +716,26 @@ function computeFetch(repo: Repo, a: FetchArgs): { acks: string[]; shallow: stri
   const pack = send.size ? writePack([...send.entries()].map(([oid, o]) => ({ ...o, oid }))) : null;
   return { acks, shallow, unshallow, pack, wantedRefs };
 }
+// Fetch responses are a pure function of (repo objects/refs, FetchArgs), so
+// they are cached per repo, keyed by the repo version (bumped on every
+// objects/refs mutation) plus the canonical args. Bounded FIFO so a long
+// trial cannot grow memory without bound. A hit returns the exact same
+// bytes a recompute would, so replay stays byte-identical.
+const FETCH_CACHE_MAX = 64;
+function fetchCached(repo: Repo, v2: boolean, a: FetchArgs, build: () => Buffer): Buffer {
+  const key = `${repo.version}|${v2 ? '2' : '0'}|${JSON.stringify([a.wants, a.haves, a.shallow, a.depth, a.deepenSince, a.deepenNot, a.wantRefs, a.deepenRelative])}`;
+  const hit = repo.fetchCache.get(key);
+  if (hit) return hit;
+  const out = build();
+  if (repo.fetchCache.size >= FETCH_CACHE_MAX) {
+    const oldest = repo.fetchCache.keys().next().value;
+    if (oldest !== undefined) repo.fetchCache.delete(oldest);
+  }
+  repo.fetchCache.set(key, out);
+  return out;
+}
 function fetchResponseV2(repo: Repo, a: FetchArgs): Buffer {
+  return fetchCached(repo, true, a, () => {
   const { acks, shallow, unshallow, pack, wantedRefs } = computeFetch(repo, a);
   const parts: Buffer[] = [];
   // Protocol v2: the acknowledgments section is sent only when the client
@@ -714,8 +764,10 @@ function fetchResponseV2(repo: Repo, a: FetchArgs): Buffer {
   }
   parts.push(pktFlush());
   return Buffer.concat(parts);
+  });
 }
 function fetchResponseV0(repo: Repo, a: FetchArgs): Buffer {
+  return fetchCached(repo, false, a, () => {
   const { acks, shallow, unshallow, pack } = computeFetch(repo, a);
   const parts: Buffer[] = [];
   if (acks.length) for (const ack of acks) parts.push(pktLine(`ACK ${ack}\n`));
@@ -725,6 +777,7 @@ function fetchResponseV0(repo: Repo, a: FetchArgs): Buffer {
   parts.push(...sidebandPack(pack));
   parts.push(pktFlush());
   return Buffer.concat(parts);
+  });
 }
 function parseFetchArgs(lines: string[]): FetchArgs {
   const a: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, deepenSince: null, deepenNot: [], wantRefs: [], deepenRelative: false };
@@ -772,10 +825,11 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   }
   let unpackOk = true;
   const packBytes = body.subarray(packStart);
+  let mutated = false;
   if (packBytes.length > 0) {
     try {
       for (const e of readPack(packBytes, (oid) => repo.objects.get(oid))) {
-        if (!repo.objects.has(e.oid)) repo.objects.set(e.oid, { type: e.type, data: e.data });
+        if (!repo.objects.has(e.oid)) { repo.objects.set(e.oid, { type: e.type, data: e.data }); mutated = true; }
       }
     } catch {
       unpackOk = false;
@@ -792,20 +846,21 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
       if (c.newOid === ZERO_OID) {
         if (!cur) reason = 'remote ref does not exist';
         else if (c.oldOid !== ZERO_OID && c.oldOid !== cur) reason = 'non-fast-forward';
-        else { repo.refs.delete(c.ref); ok = true; }
+        else { repo.refs.delete(c.ref); mutated = true; ok = true; }
       } else if (!repo.objects.has(c.newOid)) {
         reason = 'object not found';
       } else if (!cur) {
         if (c.oldOid !== ZERO_OID) reason = 'non-fast-forward';
-        else { repo.refs.set(c.ref, c.newOid); ok = true; }
+        else { repo.refs.set(c.ref, c.newOid); mutated = true; ok = true; }
       } else if (c.oldOid !== cur) {
         reason = 'non-fast-forward';
       } else if (c.newOid === cur || isAncestor(repo, cur, c.newOid)) {
-        repo.refs.set(c.ref, c.newOid); ok = true;
+        repo.refs.set(c.ref, c.newOid); mutated = true; ok = true;
       } else reason = 'non-fast-forward';
     }
     reportLines.push(ok ? `ok ${c.ref}\n` : `ng ${c.ref} ${reason}\n`);
   }
+  if (mutated) bumpVersion(repo);
   // report-status over side-band-64k: the band-1 payload is itself a
   // pkt-line stream ("unpack ok\n", "ok <ref>\n" / "ng <ref> <reason>\n").
   // Real git demuxes the sideband and then reads those pkt-lines; raw
@@ -854,7 +909,7 @@ function repoJson(r: Repo): Record<string, unknown> {
 }
 function issueJson(r: Repo, i: IssueRec): Record<string, unknown> {
   return {
-    id: i.dbId, node_id: globalId('I', r.dbId, i.number), number: i.number,
+    id: i.dbId, node_id: i.nodeId, number: i.number,
     title: i.title, body: i.body, state: i.state,
     labels: i.labels.map((name) => ({ name, color: r.labels.get(name)?.color ?? 'ededed' })),
     user: { login: VIEWER.login, id: VIEWER.id, type: 'User' },
@@ -975,6 +1030,7 @@ function handleRest(ctx: ReqCtx, res: http.ServerResponse): void {
         if (!ref.startsWith('refs/') || !isOid(sha) || !repo.objects.has(sha)) { errJson(res, 422, 'Invalid ref or sha'); return; }
         if (repo.refs.has(ref)) { errJson(res, 422, 'Reference already exists'); return; }
         repo.refs.set(ref, sha);
+        bumpVersion(repo);
         jsonBody(res, 201, { ref, object: { sha, type: repo.objects.get(sha)?.type ?? 'commit' } }); return;
       }
       if (method === 'GET' && rest.length > 2) {
@@ -1060,7 +1116,7 @@ function handleRest(ctx: ReqCtx, res: http.ServerResponse): void {
         let tip = repo.refs.get(`refs/heads/${branch}`);
         if (!tip) {
           const defTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-          if (defTip) repo.refs.set(`refs/heads/${branch}`, defTip);
+          if (defTip) { repo.refs.set(`refs/heads/${branch}`, defTip); bumpVersion(repo); }
           tip = repo.refs.get(`refs/heads/${branch}`);
         }
         const files = tip ? filesOfCommit(repo, tip) ?? new Map<string, { oid: string; mode: string }>() : new Map<string, { oid: string; mode: string }>();
@@ -1118,9 +1174,10 @@ function handleRest(ctx: ReqCtx, res: http.ServerResponse): void {
           const labels = Array.isArray(body.labels) ? (body.labels as unknown[]).map((l) => String(l)) : [];
           for (const l of labels) if (!repo.labels.has(l)) { errJson(res, 422, `Label "${l}" does not exist`); return; }
           const stamp = nextStamp();
+          const num = repo.nextNumber++;
           const issue: IssueRec = {
-            number: repo.nextNumber++, title, body: typeof body.body === 'string' ? body.body : '',
-            state: 'open', labels, seq: tick, dbId: nextGlobalId++, createdAt: stamp.iso, updatedAt: stamp.iso, comments: [],
+            number: num, title, body: typeof body.body === 'string' ? body.body : '',
+            state: 'open', labels, seq: tick, dbId: nextGlobalId++, nodeId: globalId('I', repo.dbId, num), createdAt: stamp.iso, updatedAt: stamp.iso, comments: [],
           };
           repo.issues.set(issue.number, issue);
           jsonBody(res, 201, issueJson(repo, issue)); return;
@@ -1441,9 +1498,10 @@ function resolveIssues(repo: Repo, args: Record<string, GqlValue>): GqlNode {
 }
 function createIssueGql(repo: Repo, title: string, body: string): IssueRec {
   const stamp = nextStamp();
+  const num = repo.nextNumber++;
   const issue: IssueRec = {
-    number: repo.nextNumber++, title, body: body ?? '', state: 'open', labels: [],
-    seq: tick, dbId: nextGlobalId++, createdAt: stamp.iso, updatedAt: stamp.iso, comments: [],
+    number: num, title, body: body ?? '', state: 'open', labels: [],
+    seq: tick, dbId: nextGlobalId++, nodeId: globalId('I', repo.dbId, num), createdAt: stamp.iso, updatedAt: stamp.iso, comments: [],
   };
   repo.issues.set(issue.number, issue);
   return issue;
@@ -1611,7 +1669,7 @@ function executeField(node: GqlNode | null, field: GqlField, errors: { message: 
     case 'Issue': {
       const { repo, issue } = node;
       switch (field.name) {
-        case 'id': return globalId('I', repo.dbId, issue.number);
+        case 'id': return issue.nodeId;
         case 'number': return issue.number;
         case 'title': return issue.title;
         case 'state': return issueStateGql(issue);
@@ -1906,6 +1964,14 @@ async function readBody(req: http.IncomingMessage): Promise<Buffer> {
   for await (const c of req) chunks.push(c as Buffer);
   return Buffer.concat(chunks);
 }
+// Requests without a body (no content-length / transfer-encoding) need no
+// stream drain: awaiting the async iterator costs a tick per request even
+// when there is nothing to read (~17% on GET issue in micro-bench). A
+// DELETE/GET that DOES carry a body still declares it, so it is read.
+async function readBodyIfAny(req: http.IncomingMessage): Promise<Buffer> {
+  if (req.headers['content-length'] === undefined && req.headers['transfer-encoding'] === undefined) return Buffer.alloc(0);
+  return readBody(req);
+}
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', 'http://x');
@@ -1980,7 +2046,7 @@ const server = http.createServer(async (req, res) => {
     if (path.startsWith('/api/v3')) {
       if (!authed(req)) { errJson(res, 401, 'Unauthorized'); return; }
       const segs = path.slice('/api/v3'.length).split('/').filter((s) => s !== '');
-      const raw = await readBody(req);
+      const raw = await readBodyIfAny(req);
       let parsed: unknown = undefined;
       if (raw.length > 0) {
         try { parsed = JSON.parse(raw.toString('utf8')); } catch { errJson(res, 400, 'Malformed JSON body'); return; }
@@ -1990,7 +2056,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (path === '/api/graphql' && method === 'POST') {
       if (!authed(req)) { errJson(res, 401, 'Unauthorized'); return; }
-      const raw = await readBody(req);
+      const raw = await readBodyIfAny(req);
       let parsed: unknown;
       try { parsed = JSON.parse(raw.toString('utf8')); } catch { jsonBody(res, 400, { errors: [{ message: 'Malformed JSON body' }] }); return; }
       if (Array.isArray(parsed)) {
@@ -2009,7 +2075,7 @@ const server = http.createServer(async (req, res) => {
       if (method === 'DELETE') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(''); return; }
       if (method !== 'POST') { errJson(res, 405, 'Method Not Allowed'); return; }
       if (!authed(req)) { errJson(res, 401, 'Unauthorized'); return; }
-      const raw = await readBody(req);
+      const raw = await readBodyIfAny(req);
       handleMcp(raw, res);
       return;
     }
